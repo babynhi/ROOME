@@ -1,30 +1,3 @@
-"""
-Discord bot version of the "Request a Space Booking" Google Form,
-connected to a Google Sheet.
-
-How it works
-  * /book-space opens the form (split in 2 steps, Discord allows max 5 fields per pop-up).
-  * Each submitted request is added as a new row in the sheet with Status = "Pending".
-  * You change the Status cell in the sheet (dropdown: Pending, In Review, Booked,
-    Rejected, Cancelled) and can write the room / details in the "Notes" column.
-  * Each request gets its own forum post (the bot only works with forum channels):
-      - /book-space used inside a forum post with no request yet -> that post is used
-      - otherwise (post already has a request, or used outside a forum)
-                                    -> a new post is created in the same forum, or
-                                       in the SUBMISSIONS_CHANNEL_ID forum
-    The post (thread) ID is saved in the sheet.
-  * Status can be changed two ways, and both post the update in the request's
-    thread (pinging the requester):
-      - In Discord: /set-status (admins). Inside a request thread, no ID needed.
-      - In the sheet: edit the Status cell. The Apps Script in apps_script.gs pings
-        the bot instantly; the bot also re-checks the sheet every POLL_SECONDS as a
-        safety net.
-    A hidden "last notified" column makes sure each change is announced once.
-  * /my-requests shows a user their requests, current status and thread link.
-
-Setup — see README section at the bottom of this file.
-"""
-
 import asyncio
 import os
 import re
