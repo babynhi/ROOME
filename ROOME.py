@@ -445,7 +445,8 @@ async def create_forum_post(
 ) -> discord.Thread:
     result = await forum.create_thread(
         name=name[:100], content=content, embed=embed, auto_archive_duration=10080,
-        allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+        allowed_mentions=discord.AllowedMentions(
+            users=True, roles=False, everyone=False),
     )
     return result.thread
 
@@ -636,12 +637,14 @@ async def notify_user(r: dict) -> bool:
             thread = await create_forum_post(
                 forum, f"{r.get(COL_ID)} · {r.get(COL_EVENT, '')}", mention, embed)
         except discord.HTTPException as exc:
-            print(f"[notify] Couldn't create forum post for {r.get(COL_ID)}: {exc!r}")
+            print(
+                f"[notify] Couldn't create forum post for {r.get(COL_ID)}: {exc!r}")
             return False
         try:
             await asyncio.to_thread(sheet.set_thread, r.get(COL_ID), thread.id)
         except Exception as exc:
-            print(f"[sheet] Couldn't save forum post for {r.get(COL_ID)}: {exc!r}")
+            print(
+                f"[sheet] Couldn't save forum post for {r.get(COL_ID)}: {exc!r}")
         return True
 
     try:
@@ -762,48 +765,3 @@ async def on_ready():
 
 if __name__ == "__main__":
     bot.run(TOKEN)
-
-
-# ============================================================== README
-#
-# 1. Install:            pip install -U discord.py gspread python-dotenv
-#
-# 2. Google service account (lets the bot edit your sheet):
-#    a. https://console.cloud.google.com -> create (or pick) a project
-#    b. "APIs & Services" -> "Enable APIs" -> enable **Google Sheets API**
-#    c. "IAM & Admin" -> "Service Accounts" -> Create -> open it -> "Keys"
-#       -> Add key -> JSON. Save the file next to this script as service_account.json
-#    d. Open the JSON, copy "client_email" (…@….iam.gserviceaccount.com)
-#
-# 3. Create a Google Sheet, click Share, and give that client_email **Editor** access.
-#    The sheet ID is the part of the URL between /d/ and /edit.
-#
-# 4. Environment variables, then run:
-#    export DISCORD_TOKEN="your-bot-token"
-#    export GOOGLE_SHEET_ID="the-sheet-id"
-#    export SUBMISSIONS_CHANNEL_ID="forum-id"       # recommended: forum where new posts are
-#                                                   # created when /book-space isn't used in a
-#                                                   # fresh forum post (must be a forum channel)
-#    export ADMIN_ROLE_ID="role-id-or-name"         # optional: role allowed to use /set-status
-#                                                   # (Manage Server members can always use it)
-#    export WEBHOOK_SECRET="any-long-random-text"   # optional: enables instant sheet updates
-#    export WEBHOOK_PORT=8080                       # optional
-#    export POLL_SECONDS=60                         # optional; use 600 once the Apps Script works
-#    python booking_bot.py
-#
-#    Instant updates from the sheet: the bot listens on WEBHOOK_PORT at /sheet-edit.
-#    Google must be able to reach it over HTTPS:
-#      - on a host (Railway, Render, a VPS…): use the URL they give you
-#      - on your own computer: run a tunnel, e.g.
-#          cloudflared tunnel --url http://localhost:8080
-#        and use the https://….trycloudflare.com address it prints
-#    Then set up apps_script.gs in the sheet (instructions inside that file).
-#    Without this, sheet edits still reach Discord through the regular check.
-#
-#    On first run the bot creates a "Requests" tab with headers, a Status
-#    dropdown, and two hidden bookkeeping columns (don't delete those).
-#
-# 5. Discord permissions the bot needs in the forum channel(s):
-#    View Channel, Send Messages (= create posts), Embed Links,
-#    Send Messages in Posts. If the forum has "Require tags" on, turn it off
-#    (the bot creates posts without tags).
