@@ -2,7 +2,9 @@ import asyncio
 import os
 import re
 import secrets
-from datetime import datetime
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 
 import discord
 import gspread
@@ -38,6 +40,21 @@ ATTENDANCE_TYPES = [
     "Open to Internal Community",
     "Open to Public",
 ]
+EXTERNAL_ATTENDANCE = ATTENDANCE_TYPES[1:3]  # these need a speaker list
+
+BOOKING_TYPES = ["Classroom", "Event Space", "Information Table/ Kiosk",
+                 "Reggie's", "Not sure what's best", "Other"]
+# booking type -> (minimum notice, counted in business days?)
+LEAD_TIMES = {
+    "Classroom": (10, True),
+    "Event Space": (20, True),
+    "Information Table/ Kiosk": (15, False),
+    "Reggie's": (25, False),
+}
+ROOM_CATALOGUE_URL = "https://docs.google.com/document/d/1D3kHhFFzJaAwt7RProGksD9EQZlnFwLykDCgqECllTE/edit?usp=sharing"
+DSA_LIST_URL = "https://www.concordia.ca/content/dam/concordia/services/event-planning/docs/Concordia-DSA-List.pdf"
+FOOD_PROCEDURES_URL = "https://www.concordia.ca/content/dam/concordia/services/event-planning/docs/Procedures-for-saleor-service-of-food.pdf"
+FOOD_WAIVER_URL = "https://www.concordia.ca/content/dam/concordia/services/event-planning/docs/Concordia-Food-Waiver-Form.pdf"
 
 STATUSES = ["Pending", "In Review", "Booked", "Rejected", "Cancelled"]
 STATUS_COLORS = {
@@ -65,14 +82,289 @@ COL_NOTES = "Notes"
 COL_NOTIFIED = "Bot: Last Notified Status"  # managed by the bot, hidden
 COL_THREAD = "Bot: Discord Thread ID"        # managed by the bot, hidden
 
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+TIME_RE = re.compile(
+    r"^(\d{1,2})(?:\s*([:h.])\s*(\d{2})?)?\s*([ap])?\.?\s*(?:m\.?)?$", re.I)
+DATE_FORMATS = ["%Y-%m-%d", "%Y/%m/%d", "%B %d %Y",
+                "%b %d %Y", "%B %d, %Y", "%b %d, %Y", "%d %B %Y", "%d %b %Y"]
+
+
+# ---------------------------------------------------------------- Answer checks
+# Each takes a page's answers, may tidy them in place,
+# and returns a list of problems to show the user.
+def parse_date(text: str) -> date | None:
+    for fmt in DATE_FORMATS:
+        try:
+            return datetime.strptime(text.strip(), fmt).date()
+        except ValueError:
+            pass
+    return None
+
+
+def parse_time(text: str) -> str | None:
+    """'6pm', '6:30 PM', '18:00', '18h' -> 'HH:MM' (24h), or None."""
+    m = TIME_RE.match(text.strip())
+    if not m:
+        return None
+    hour, sep, minute, ampm = int(m[1]), m[2], int(m[3] or 0), (m[4] or "").lower()
+    if ampm:
+        if not 1 <= hour <= 12:
+            return None
+        hour = hour % 12 + (12 if ampm == "p" else 0)
+    elif not sep:  # a bare "6" could be morning or evening
+        return None
+    if hour > 23 or minute > 59:
+        return None
+    return f"{hour:02d}:{minute:02d}"
+
+
+def check_contact(a: dict) -> list[str]:
+    errors = []
+    if not EMAIL_RE.match(a["contact_email"]):
+        errors.append("• The email address doesn't look valid.")
+    if len(re.sub(r"\D", "", a["contact_phone"])) < 10:
+        errors.append("• The phone number needs at least 10 digits.")
+    return errors
+
+
+def check_attendance(a: dict) -> list[str]:
+    value = a["expected_attendance"]
+    if not value.isdigit() or int(value) <= 0:
+        return ["• Expected attendance must be a positive whole number."]
+    a["expected_attendance"] = str(int(value))
+    return []
+
+
+def check_av(a: dict) -> list[str]:
+    if "No IT equipment required" in a["av_equipment"] and len(a["av_equipment"]) > 1:
+        return ["• You picked equipment *and* \"No IT equipment required\". Pick one or the other."]
+    return []
+
+
+def check_date_time(a: dict) -> list[str]:
+    errors = []
+    day = parse_date(a["event_date"])
+    if day is None:
+        errors.append("• Write the date like 2026-11-20.")
+    elif day < date.today():
+        errors.append("• The date is in the past.")
+    else:
+        a["event_date"] = day.isoformat()
+    start, end = parse_time(a["start_time"]), parse_time(a["end_time"])
+    if start is None:
+        errors.append("• The start time doesn't look valid (try 18:00 or 6pm).")
+    if end is None:
+        errors.append("• The end time doesn't look valid (try 20:00 or 8pm).")
+    if start and end:
+        if end <= start:
+            errors.append("• The end time must be after the start time.")
+        a["start_time"], a["end_time"] = start, end
+    return errors
+
+
+def check_location(a: dict) -> list[str]:
+    if "Other" in a["locations"] and not a["venue"]:
+        return ["• You ticked **Other**: name the building in the venue box."]
+    return []
+
+
+# ---------------------------------------------------------------- Form definition
+@dataclass
+class Field:
+    key: str          # name in the answers dict
+    column: str       # sheet header
+    label: str        # max 45 characters
+    kind: str = "short"  # short | paragraph | radio | checkbox
+    description: str | None = None  # max 100 characters
+    placeholder: str | None = None
+    options: tuple[str, ...] = ()
+    required: bool = True
+    max_length: int | None = None
+    when: Callable[[dict], bool] | None = None  # only asked if this returns True
+
+    def applies(self, d: dict) -> bool:
+        return self.when is None or self.when(d)
+
+    def build(self, value) -> discord.ui.Item:
+        if self.kind == "radio":
+            return discord.ui.RadioGroup(required=self.required, options=[
+                discord.RadioGroupOption(label=o, default=o == value) for o in self.options])
+        if self.kind == "checkbox":
+            chosen = value or []
+            return discord.ui.CheckboxGroup(
+                required=self.required, min_values=1 if self.required else 0,
+                max_values=len(self.options), options=[
+                    discord.CheckboxGroupOption(label=o, default=o in chosen) for o in self.options])
+        paragraph = self.kind == "paragraph"
+        return discord.ui.TextInput(
+            style=discord.TextStyle.paragraph if paragraph else discord.TextStyle.short,
+            placeholder=self.placeholder, required=self.required, default=value or None,
+            max_length=self.max_length or (1000 if paragraph else 100),
+        )
+
+
+@dataclass
+class Step:
+    title: str
+    fields: list[Field]
+    intro: str = ""  # shown above the button that opens this page
+    check: Callable[[dict], list[str]] | None = None
+
+    def fields_for(self, d: dict) -> list[Field]:
+        return [f for f in self.fields if f.applies(d)]
+
+
+def _booking(*types: str) -> Callable[[dict], bool]:
+    return lambda d: d.get("booking_type") in types
+
+
+def _self_catering(d: dict) -> bool:
+    return d.get("food") == "Self-catering"
+
+
+def _external(d: dict) -> bool:
+    return d.get("attendance_type") in EXTERNAL_ATTENDANCE
+
+
+# Mirrors the Google Form "Space Booking 26/27". Discord allows 5 fields per pop-up,
+# and a page whose fields all have a `when` that doesn't apply is skipped.
+FORM = [
+    Step("Contact & Event", [
+        Field("contact_name", COL_CONTACT, "Onsite contact name",
+              description="Person responsible for the event"),
+        Field("contact_email", COL_EMAIL, "Onsite contact email",
+              placeholder="name@example.com"),
+        Field("contact_phone", COL_PHONE, "Onsite contact phone number",
+              placeholder="514-555-0123", max_length=25),
+        Field("event_name", COL_EVENT, "Name of event"),
+        Field("event_description", COL_DESC, "Describe the event", "paragraph",
+              description="Purpose & activities"),
+    ], check=check_contact),
+    Step("Attendance", [
+        Field("expected_attendance", COL_ATTENDANCE, "Total expected attendance",
+              placeholder="e.g. 40", max_length=6),
+        Field("attendance_type", COL_ATT_TYPE, "Type of attendance", "radio",
+              options=tuple(ATTENDANCE_TYPES)),
+    ], check=check_attendance),
+    Step("External Members", [
+        Field("speakers", "Speakers", "Expected speakers", "paragraph", when=_external,
+              description="Names and a brief bio of each expected speaker (a list of potential speakers is fine)"),
+    ]),
+    Step("Food & Alcohol", [
+        Field("alcohol", "Alcohol", "Will you serve or sell alcohol?", "radio",
+              options=("Yes", "No")),
+        Field("food", "Food", "Food at your event?", "radio",
+              description="Will you be self-catering or using an approved caterer?",
+              options=("Self-catering", "Working with an approved caterer", "No food")),
+    ]),
+    Step("Self-Catered Event", [
+        Field("food_risk", "Food Risk", "Will the food be high or low risk?", "radio",
+              when=_self_catering, options=(
+                  "Low risk (doesn't need to be kept hot/cold)",
+                  "High risk (needs to be kept hot/cold)")),
+        Field("food_equipment", "Food Equipment", "Food preparation & temperature equipment",
+              "paragraph", when=_self_catering,
+              description="What will be used onsite to prepare and/or keep foods at proper temperature?"),
+        Field("food_items", "Food Items", "Food items you will serve", "paragraph",
+              when=_self_catering, description="List all of them, e.g. cream cheese with bagels"),
+    ], intro=(
+        "A Food Waiver is **not** required for self-catered events serving or selling **low risk** food, "
+        f"but you must follow the [Procedures for the Sale or Service of Food]({FOOD_PROCEDURES_URL}).\n"
+        "**High risk** food contains milk products, eggs, meat or anything else that can grow bacteria, "
+        "including cooked vegetables and grains and warm iced tea. If you are **selling** high risk food, "
+        f"fill out the [Concordia Food Waiver]({FOOD_WAIVER_URL}) and request a Special Event Permit "
+        "from the MAPAQ."
+    )),
+    Step("Event Details (1/2)", [
+        Field("teaching", "Teaching / Third Party", "Teaching & learning activity?", "paragraph",
+              description="If yes, are you working with a third party (internal or external)? Name the organization(s)."),
+        Field("advertising", "Advertising", "Where will the event be advertised?", "paragraph"),
+        Field("selling", "Selling Items", "Selling items on-site?", "paragraph",
+              description="If yes, describe what items you plan to sell on-site."),
+        Field("music", "Music", "Music during your event?", "paragraph",
+              description="If yes, describe what you're planning in terms of music."),
+        Field("hybrid", "Hybrid / Online", "Hybrid or online component?", "paragraph",
+              description="e.g. speakers or attendees joining remotely. If yes, give as much detail as possible."),
+    ]),
+    Step("Event Details (2/2)", [
+        Field("av_equipment", "AV / IT Equipment", "Audiovisual / IT equipment needed", "checkbox",
+              options=("Projector", "Computer", "Audio (Speakers, Microphone)",
+                       "Visual (Camera)", "No IT equipment required")),
+        Field("scs_responsibility", "SCS Responsibility", "Is SCS fully responsible for this event?",
+              "paragraph",
+              description="Is SCS making the key decisions? If not, name the department or organization."),
+        Field("other_details", "Other Details", "Any other details about your event?", "paragraph",
+              required=False),
+    ], check=check_av),
+    Step("Time, Date & Location", [
+        Field("event_date", "Date", "Date of event", placeholder="YYYY-MM-DD", max_length=20),
+        Field("start_time", "Start Time", "Start time", placeholder="e.g. 18:00 or 6pm", max_length=10),
+        Field("end_time", "End Time", "End time", placeholder="e.g. 20:00 or 8pm", max_length=10),
+        Field("booking_type", "Booking Type", "What are you booking?", "radio",
+              options=tuple(BOOKING_TYPES)),
+    ], check=check_date_time, intro=(
+        "Book ahead:\n"
+        "• **Classroom**: at least 10 business days before (e.g. Algotime, info sessions, workshops, "
+        "movie nights) in H, EV, MB or FG\n"
+        "• **Event space**: at least 20 business days before (e.g. Wine & Cheese, career panel) in EV or MB\n"
+        "• **Information table / kiosk**: at least 15 days before (e.g. clothing sales, recruitment booth) "
+        "in H, EV or MB\n"
+        "• **Reggie's**: at least 25 days before (e.g. Lizard Lounges)\n"
+        f"For other rooms or set-ups, see the [Room Booking Catalogue]({ROOM_CATALOGUE_URL}) "
+        f"and the [DSA List]({DSA_LIST_URL})."
+    )),
+    Step("Location", [
+        Field("locations", "Preferred Locations", "Preferred building(s)", "checkbox",
+              when=_booking("Classroom"), options=("H", "EV", "MB", "FG", "No preference", "Other")),
+        Field("locations", "Preferred Locations", "Preferred building(s)", "checkbox",
+              when=_booking("Event Space"), options=("EV", "MB", "No preference", "Other")),
+        Field("locations", "Preferred Locations", "Preferred building(s)", "checkbox",
+              when=_booking("Information Table/ Kiosk"), options=("H", "MB", "EV", "No preference", "Other")),
+        Field("venue", "Desired Venue", "Desired classroom", required=False,
+              when=_booking("Classroom"),
+              description="Leave empty if you have no preference. Ticked Other? Name the building here."),
+        Field("venue", "Desired Venue", "Desired type of venue", when=_booking("Event Space"),
+              description="e.g. conference room, atrium, salon, lounge, MB Green Roof Terrace, Cloud Deck",
+              placeholder="No preference"),
+        Field("venue", "Desired Venue", "Desired type of venue",
+              when=_booking("Information Table/ Kiosk"),
+              description="e.g. H Mezzanine Tables A-D, H 7th floor large lounge or cafeteria",
+              placeholder="No preference"),
+    ], check=check_location),
+    Step("Additional Information", [
+        Field("booking_other", "Other Booking Request", "What would you like to book?",
+              when=_booking("Other")),
+        Field("additional_info", "Additional Info", "Anything else we should know?", "paragraph",
+              required=False),
+    ]),
+]
+
+# Sheet columns: the bot's own, then one per form question, then the admin ones
 COLUMNS = [
-    COL_ID, COL_SUBMITTED, COL_USER, COL_USER_ID, COL_CONTACT, COL_EMAIL, COL_PHONE,
-    COL_EVENT, COL_DESC, COL_ATTENDANCE, COL_ATT_TYPE, COL_STATUS, COL_NOTES,
-    COL_NOTIFIED, COL_THREAD,
+    COL_ID, COL_SUBMITTED, COL_USER, COL_USER_ID,
+    *dict.fromkeys(f.column for step in FORM for f in step.fields),
+    COL_STATUS, COL_NOTES, COL_NOTIFIED, COL_THREAD,
 ]
 HIDDEN_COLUMNS = [COL_NOTIFIED, COL_THREAD]
 
-EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+def as_text(value) -> str:
+    return ", ".join(value) if isinstance(value, list) else str(value)
+
+
+def lead_time_warning(d: dict) -> str | None:
+    """A note if the event is sooner than the booking type's minimum notice."""
+    if d.get("booking_type") not in LEAD_TIMES or not d.get("event_date"):
+        return None
+    needed, business = LEAD_TIMES[d["booking_type"]]
+    today, day = date.today(), date.fromisoformat(d["event_date"])
+    days = range(1, (day - today).days + 1)
+    notice = sum(1 for i in days if not business or (today + timedelta(i)).weekday() < 5)
+    if notice >= needed:
+        return None
+    unit = "business days" if business else "days"
+    return (f"⚠️ {d['booking_type']} bookings need at least {needed} {unit} of notice "
+            f"and your event is in {notice}. It may not be possible to book in time.")
 
 
 # ---------------------------------------------------------------- Google Sheet
@@ -166,13 +458,7 @@ class RequestSheet:
             COL_SUBMITTED: datetime.now().astimezone().strftime("%Y-%m-%d %H:%M"),
             COL_USER: user,
             COL_USER_ID: str(user_id),
-            COL_CONTACT: d["contact_name"],
-            COL_EMAIL: d["contact_email"],
-            COL_PHONE: d["contact_phone"],
-            COL_EVENT: d["event_name"],
-            COL_DESC: d["event_description"],
-            COL_ATTENDANCE: str(d["expected_attendance"]),
-            COL_ATT_TYPE: d["attendance_type"],
+            **{f.column: as_text(d[f.key]) for step in FORM for f in step.fields if f.key in d},
             COL_STATUS: "Pending",
             COL_NOTES: "",
             COL_NOTIFIED: "Pending",
@@ -246,166 +532,135 @@ sheet: RequestSheet | None = None
 drafts: dict[int, dict] = {}
 
 
-# ---------------------------------------------------------------- Form step 1
-class ContactEventModal(discord.ui.Modal, title="Request a Space Booking (1/2)"):
-    contact_name = discord.ui.TextInput(
-        label="Onsite contact name",
-        placeholder="Person responsible for the event",
-        max_length=100,
-    )
-    contact_email = discord.ui.TextInput(
-        label="Onsite contact email",
-        placeholder="name@example.com",
-        max_length=100,
-    )
-    contact_phone = discord.ui.TextInput(
-        label="Onsite contact phone number",
-        placeholder="514-555-0123",
-        max_length=25,
-    )
-    event_name = discord.ui.TextInput(
-        label="Name of event",
-        max_length=100,
-    )
-    event_description = discord.ui.TextInput(
-        label="Describe the event (purpose & activities)",
-        style=discord.TextStyle.paragraph,
-        max_length=1000,
+# ---------------------------------------------------------------- Form pages
+def next_step(start: int, d: dict) -> int | None:
+    """Index of the next page with at least one question that applies, or None when done."""
+    for i in range(start, len(FORM)):
+        if FORM[i].fields_for(d):
+            return i
+    return None
+
+
+async def session_expired(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        "Your session expired — please run `/book-space` again.", ephemeral=True
     )
 
-    def __init__(self, defaults: dict | None = None):
-        super().__init__()
-        # Pre-fill when reopening after a validation error
-        for key, value in (defaults or {}).items():
-            field = getattr(self, key, None)
-            if isinstance(field, discord.ui.TextInput):
-                field.default = value
+
+class StepModal(discord.ui.Modal):
+    """One page of the booking form, built from FORM[index]."""
+
+    def __init__(self, index: int, d: dict, retry: dict | None = None):
+        self.step = FORM[index]
+        super().__init__(title=f"Space Booking · {self.step.title}"[:45])
+        self.index = index
+        self.inputs: dict[str, discord.ui.Item] = {}
+        # Pre-fill with earlier answers, or with the rejected ones after a validation error
+        prefill = {**d, **(retry or {})}
+        for f in self.step.fields_for(d):
+            component = f.build(prefill.get(f.key))
+            self.add_item(discord.ui.Label(
+                text=f.label, description=f.description, component=component))
+            self.inputs[f.key] = component
 
     async def on_submit(self, interaction: discord.Interaction):
-        answers = {
-            "contact_name": self.contact_name.value.strip(),
-            "contact_email": self.contact_email.value.strip(),
-            "contact_phone": self.contact_phone.value.strip(),
-            "event_name": self.event_name.value.strip(),
-            "event_description": self.event_description.value.strip(),
-        }
+        draft = drafts.get(interaction.user.id)
+        if draft is None:
+            await session_expired(interaction)
+            return
 
-        errors = []
-        if not EMAIL_RE.match(answers["contact_email"]):
-            errors.append("• The email address doesn't look valid.")
-        if len(re.sub(r"\D", "", answers["contact_phone"])) < 10:
-            errors.append("• The phone number needs at least 10 digits.")
+        answers = {}
+        for key, c in self.inputs.items():
+            if isinstance(c, discord.ui.CheckboxGroup):
+                answers[key] = list(c.values)
+            elif isinstance(c, discord.ui.RadioGroup):
+                answers[key] = c.value or ""
+            else:
+                answers[key] = c.value.strip()
 
+        errors = self.step.check(answers) if self.step.check else []
         if errors:
             await interaction.response.send_message(
                 "Please fix the following:\n" + "\n".join(errors),
-                view=RetryView(answers),
+                view=StepView(self.index, "Fix my answers", retry=answers),
                 ephemeral=True,
             )
             return
 
-        drafts[interaction.user.id] = answers
+        draft.update(answers)
+        index = next_step(self.index + 1, draft)
+        if index is None:
+            await submit_request(interaction, draft)
+            return
+        step = FORM[index]
         await interaction.response.send_message(
-            "**Step 2 of 2** — select the type of attendance for this event:",
-            view=AttendanceTypeView(),
+            f"**Next: {step.title}**" + (f"\n{step.intro}" if step.intro else ""),
+            view=StepView(index, "Continue"),
             ephemeral=True,
+            suppress_embeds=True,
         )
 
 
-class RetryView(discord.ui.View):
-    """Lets the user reopen step 1 without retyping everything."""
+class StepView(discord.ui.View):
+    """A button that opens a form page (a modal can't be opened straight from another)."""
 
-    def __init__(self, answers: dict):
+    def __init__(self, index: int, label: str, retry: dict | None = None):
         super().__init__(timeout=600)
-        self.answers = answers
+        self.index = index
+        self.retry = retry
+        self.open_step.label = label
 
-    @discord.ui.button(label="Fix my answers", style=discord.ButtonStyle.primary)
-    async def retry(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(ContactEventModal(defaults=self.answers))
-
-
-# ---------------------------------------------------------------- Form step 2
-class AttendanceTypeView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=600)
-
-    @discord.ui.select(
-        placeholder="Select the type of attendance…",
-        options=[discord.SelectOption(label=t) for t in ATTENDANCE_TYPES],
-    )
-    async def pick_type(self, interaction: discord.Interaction, select: discord.ui.Select):
+    @discord.ui.button(style=discord.ButtonStyle.primary)
+    async def open_step(self, interaction: discord.Interaction, button: discord.ui.Button):
         draft = drafts.get(interaction.user.id)
         if draft is None:
-            await interaction.response.send_message(
-                "Your session expired — please run `/book-space` again.", ephemeral=True
-            )
+            await session_expired(interaction)
             return
-        draft["attendance_type"] = select.values[0]
-        await interaction.response.send_modal(AttendanceModal())
+        await interaction.response.send_modal(StepModal(self.index, draft, self.retry))
 
 
-class AttendanceModal(discord.ui.Modal, title="Request a Space Booking (2/2)"):
-    expected_attendance = discord.ui.TextInput(
-        label="Total expected attendance",
-        placeholder="e.g. 40",
-        max_length=6,
-    )
-
-    async def on_submit(self, interaction: discord.Interaction):
-        value = self.expected_attendance.value.strip()
-        if not value.isdigit() or int(value) <= 0:
-            await interaction.response.send_message(
-                "Expected attendance must be a positive whole number. "
-                "Pick the attendance type again to retry.",
-                view=AttendanceTypeView(),
-                ephemeral=True,
-            )
-            return
-
-        draft = drafts.get(interaction.user.id)
-        if draft is None:
-            await interaction.response.send_message(
-                "Your session expired — please run `/book-space` again.", ephemeral=True
-            )
-            return
-        draft["expected_attendance"] = int(value)
-
-        # Writing to Google can take a few seconds; Discord needs an answer within 3
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        try:
-            request_id = await asyncio.to_thread(
-                sheet.add_request, str(
-                    interaction.user), interaction.user.id, draft
-            )
-        except Exception as exc:
-            print(f"[sheet] Failed to save request: {exc!r}")
-            await interaction.followup.send(
-                "⚠️ Couldn't save your request to the booking sheet. Please try again in a minute "
-                "(your answers are kept — just pick the attendance type again).",
-                view=AttendanceTypeView(),
-                ephemeral=True,
-            )
-            return
-
-        drafts.pop(interaction.user.id, None)
-        embed = build_request_embed(interaction.user, draft, request_id)
-
-        thread = await open_request_thread(interaction, embed, request_id, draft["event_name"])
-        if thread is not None:
-            try:
-                await asyncio.to_thread(sheet.set_thread, request_id, thread.id)
-            except Exception as exc:
-                print(
-                    f"[sheet] Couldn't save thread for {request_id}: {exc!r}")
-            where = f"Status updates will be posted in {thread.mention}."
-        else:
-            where = ("⚠️ I couldn't open a forum post for it "
-                     "(use `/book-space` inside a forum post, or check my permissions).")
-
+async def submit_request(interaction: discord.Interaction, draft: dict):
+    # Writing to Google can take a few seconds; Discord needs an answer within 3
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        request_id = await asyncio.to_thread(
+            sheet.add_request, str(interaction.user), interaction.user.id, draft
+        )
+    except Exception as exc:
+        print(f"[sheet] Failed to save request: {exc!r}")
         await interaction.followup.send(
-            f"✅ Request **{request_id}** was sent! {where}",
+            "⚠️ Couldn't save your request to the booking sheet. Please try again in a minute "
+            "(your answers are kept — just reopen the last page).",
+            view=StepView(len(FORM) - 1, "Try again"),
             ephemeral=True,
         )
+        return
+
+    drafts.pop(interaction.user.id, None)
+    embed = build_request_embed(interaction.user, draft, request_id)
+
+    thread = await open_request_thread(interaction, embed, request_id, draft["event_name"])
+    if thread is not None:
+        try:
+            for details in build_detail_embeds(draft):
+                await thread.send(embed=details)
+        except discord.HTTPException as exc:
+            print(f"[thread] Couldn't post details for {request_id}: {exc!r}")
+        try:
+            await asyncio.to_thread(sheet.set_thread, request_id, thread.id)
+        except Exception as exc:
+            print(
+                f"[sheet] Couldn't save thread for {request_id}: {exc!r}")
+        where = f"Status updates will be posted in {thread.mention}."
+    else:
+        where = ("⚠️ I couldn't open a forum post for it "
+                 "(use `/book-space` inside a forum post, or check my permissions).")
+
+    warning = lead_time_warning(draft)
+    await interaction.followup.send(
+        f"✅ Request **{request_id}** was sent! {where}" + (f"\n{warning}" if warning else ""),
+        ephemeral=True,
+    )
 
 
 def submissions_forum() -> discord.ForumChannel | None:
@@ -471,12 +726,54 @@ def build_request_embed(user: discord.abc.User, d: dict, request_id: str) -> dis
                     value=d["contact_name"], inline=True)
     embed.add_field(name="Email", value=d["contact_email"], inline=True)
     embed.add_field(name="Phone", value=d["contact_phone"], inline=True)
-    embed.add_field(name="Expected attendance", value=str(
-        d["expected_attendance"]), inline=True)
+    embed.add_field(name="Date", value=d["event_date"], inline=True)
+    embed.add_field(
+        name="Time", value=f"{d['start_time']}–{d['end_time']}", inline=True)
+    booking = d["booking_type"]
+    if d.get("booking_other"):
+        booking += f": {d['booking_other']}"
+    embed.add_field(name="Booking", value=booking[:1024], inline=True)
+    if d.get("locations"):
+        embed.add_field(name="Preferred locations",
+                        value=as_text(d["locations"]), inline=True)
+        embed.add_field(name="Desired venue",
+                        value=d.get("venue") or "No preference", inline=True)
+        embed.add_field(name="​", value="​", inline=True)
+    embed.add_field(name="Expected attendance",
+                    value=d["expected_attendance"], inline=True)
     embed.add_field(name="Attendance type",
                     value=d["attendance_type"], inline=True)
     embed.set_footer(text=f"Submitted by {user} ({user.id})")
     return embed
+
+
+# Answers already shown in the request embed
+SUMMARY_KEYS = {
+    "contact_name", "contact_email", "contact_phone", "event_name", "event_description",
+    "expected_attendance", "attendance_type", "event_date", "start_time", "end_time",
+    "booking_type", "booking_other", "locations", "venue",
+}
+
+
+def build_detail_embeds(d: dict) -> list[discord.Embed]:
+    """The rest of the answers. Split over several embeds, since each message
+    allows at most 25 fields and 6000 characters."""
+    embeds: list[discord.Embed] = []
+    size = 0
+    for step in FORM:
+        for f in step.fields_for(d):
+            if f.key in SUMMARY_KEYS or not d.get(f.key):
+                continue
+            value = as_text(d[f.key])[:1024]
+            if not embeds or len(embeds[-1].fields) == 25 or size + len(f.label) + len(value) > 5500:
+                embeds.append(discord.Embed(
+                    title=f"Request details ({len(embeds) + 1})", color=STATUS_COLORS["Pending"]))
+                size = 0
+            embeds[-1].add_field(name=f.label, value=value, inline=False)
+            size += len(f.label) + len(value)
+    if len(embeds) == 1:
+        embeds[0].title = "Request details"
+    return embeds
 
 
 def build_status_embed(r: dict) -> discord.Embed:
@@ -631,7 +928,8 @@ async def notify_user(r: dict) -> bool:
 
 @bot.tree.command(name="book-space", description="Request a space booking for an event")
 async def book_space(interaction: discord.Interaction):
-    await interaction.response.send_modal(ContactEventModal())
+    drafts[interaction.user.id] = {}
+    await interaction.response.send_modal(StepModal(0, {}))
 
 
 def is_admin(member: discord.abc.User) -> bool:

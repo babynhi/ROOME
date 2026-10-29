@@ -8,8 +8,8 @@ Members fill out a booking form right inside Discord. Every request is saved to 
 
 ## ✨ Features
 
-- **Booking form in Discord**: `/book-space` opens a two-step pop-up form (Discord allows at most 5 fields per pop-up).
-- **Checks answers**: rejects invalid emails, phone numbers and attendance counts, and lets people fix their answers without retyping them.
+- **The full booking form in Discord**: `/book-space` asks every question from the *Space Booking 26/27* Google Form, a few pages at a time (Discord allows at most 5 fields per pop-up). Pages that don't apply are skipped, just like the Google Form: speakers only for events with external members, food questions only for self-catering, and location questions that depend on what you're booking.
+- **Checks answers**: rejects invalid emails, phone numbers, attendance counts, dates and times, and lets people fix their answers without retyping them. Warns if the event is sooner than the minimum notice for that kind of booking.
 - **Google Sheets as the database**: each request becomes a row, with a Status dropdown and a Notes column.
 - **One thread per request**: every request gets its own Discord thread for updates and questions.
 - **Change status from either side**: use `/set-status` in Discord, or edit the Status cell in the sheet.
@@ -32,7 +32,7 @@ Members fill out a booking form right inside Discord. Every request is saved to 
 
 ## 🔄 How a request flows
 
-1. **Submit:** a member runs `/book-space` and fills out the form.
+1. **Submit:** a member runs `/book-space` and fills out the form: contact & event, attendance, (external speakers), food & alcohol, (self-catered food), event details, time, date & booking type, (location), and additional information.
 2. **Save:** ROOME adds a row to the sheet with Status **Pending**.
 3. **Thread:** ROOME posts the request and opens a thread on it, named like `R-3F9A1C · Movie Night`. If the command was used inside a thread, that thread is used instead.
 4. **Update:** an admin changes the status, either with `/set-status` or by editing the sheet.
@@ -148,13 +148,18 @@ You should see `Logged in as ROOME#…` and `[sheet] Connected to …`. Slash co
 | Submitted At, Discord User, Discord User ID | Bot | |
 | Onsite Contact, Email, Phone | Form | |
 | Event Name, Description | Form | |
-| Expected Attendance, Attendance Type | Form | |
+| Expected Attendance, Attendance Type, Speakers | Form | Speakers only for events with external members |
+| Alcohol, Food, Food Risk, Food Equipment, Food Items | Form | The last three only for self-catered events |
+| Teaching / Third Party, Advertising, Selling Items, Music, Hybrid / Online, AV / IT Equipment, SCS Responsibility, Other Details | Form | |
+| Date, Start Time, End Time, Booking Type | Form | Times are saved as 24h `HH:MM` |
+| Preferred Locations, Desired Venue | Form | Only for classrooms, event spaces and information tables/kiosks |
+| Other Booking Request, Additional Info | Form | |
 | **Status** | **You** | Dropdown: Pending, In Review, Booked, Rejected, Cancelled |
 | **Notes** | **You** | Shown in the thread update, e.g. "MB 3.430, 6–8pm" |
 | Bot: Last Notified Status | Bot | Hidden. **Don't edit or delete.** |
 | Bot: Discord Thread ID | Bot | Hidden. **Don't edit or delete.** |
 
-You can reorder, resize or sort columns freely, because ROOME finds them by their header names. Just don't rename the headers.
+You can reorder, resize or sort columns freely, because ROOME finds them by their header names. Just don't rename the headers. If your sheet is from an older version of ROOME, the new columns are added at the end automatically.
 
 ---
 
