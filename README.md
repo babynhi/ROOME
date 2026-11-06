@@ -34,7 +34,7 @@ Members fill out a booking form right inside Discord. Every request is saved to 
 
 1. **Submit:** a member runs `/book-space` and fills out the form: contact & event, attendance, (external speakers), food & alcohol, (self-catered food), event details, time, date & booking type, (location), and additional information.
 2. **Save:** ROOME adds a row to the sheet with Status **Pending**.
-3. **Thread:** ROOME posts the request and opens a thread on it, named like `R-3F9A1C · Movie Night`. If the command was used inside a thread, that thread is used instead.
+3. **Thread:** ROOME posts the request and opens a thread on it, named like `R-3F9A1C · Movie Night`. If the command was used inside a forum post that has no request yet, that post is used instead (except pinned posts, like a how-to guide).
 4. **Update:** an admin changes the status, either with `/set-status` or by editing the sheet.
 5. **Notify:** ROOME posts the new status and notes in the thread and pings the requester.
 

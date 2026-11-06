@@ -686,8 +686,10 @@ async def open_request_thread(
     channel = interaction.channel
     in_forum_post = isinstance(channel, discord.Thread) and isinstance(
         channel.parent, discord.ForumChannel)
+    # A pinned post is the forum's guide, so it never becomes a request's own post
+    reusable_post = in_forum_post and not channel.flags.pinned
     try:
-        if in_forum_post:
+        if reusable_post:
             # Reuse this post only if it doesn't already belong to another request,
             # so /set-status inside a post always means exactly one request
             try:
@@ -698,9 +700,7 @@ async def open_request_thread(
             if existing is None:
                 await channel.send(content=interaction.user.mention, embed=embed)
                 return channel
-            forum = channel.parent
-        else:
-            forum = submissions_forum()
+        forum = channel.parent if in_forum_post else submissions_forum()
         if forum is None:
             print(f"[thread] No forum to post {request_id} in "
                   "(use /book-space in a forum post or set SUBMISSIONS_CHANNEL_ID to a forum)")
